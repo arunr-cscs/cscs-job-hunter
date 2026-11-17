@@ -1,0 +1,89 @@
+# Installs a release's zips on clean GitHub machines (Apple Silicon Mac, Intel Mac, Windows) and runs the
+# app's self-test. Run it from the Actions tab (or: gh workflow run install-check.yml -f tag=v1.0.1).
+name: Install check
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to check, e.g. v1.0.1"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15          # Apple Silicon
+            messy: "yes"              # plus an Intel Anaconda-style Python in the way, like a real user's Mac
+          - runner: macos-15-intel    # Intel
+            messy: "no"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CSCS_NO_CLAUDE: "1"
+    steps:
+      - name: Download the Mac zip
+        run: |
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" -p CSCS-Job-Hunter-Mac.zip -D "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/My Downloads"
+          ditto -x -k "$RUNNER_TEMP/CSCS-Job-Hunter-Mac.zip" "$RUNNER_TEMP/My Downloads"
+          ls -la "$RUNNER_TEMP/My Downloads/CSCS Job Hunter"
+      - name: Put an Intel Python and Anaconda settings in the way (Apple Silicon only)
+        if: matrix.messy == 'yes'
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          ~/.local/bin/uv python install cpython-3.12-macos-x86_64-none
+          INTEL_PY="$(~/.local/bin/uv python find cpython-3.12-macos-x86_64-none)"
+          "$INTEL_PY" -c "import platform; print('decoy python:', platform.machine())"
+          mkdir -p "$RUNNER_TEMP/decoy/bin"; ln -s "$INTEL_PY" "$RUNNER_TEMP/decoy/bin/python3"; ln -s "$INTEL_PY" "$RUNNER_TEMP/decoy/bin/python"
+          echo "$RUNNER_TEMP/decoy/bin" >> "$GITHUB_PATH"
+          echo "CONDA_PREFIX=$RUNNER_TEMP/decoy" >> "$GITHUB_ENV"
+          echo "CONDA_DEFAULT_ENV=base" >> "$GITHUB_ENV"
+          # an earlier, broken set-up made with that Intel Python (what the old installer left behind)
+          SETUP="$HOME/Library/Application Support/CSCS Job Hunter Setup"
+          mkdir -p "$SETUP"; "$INTEL_PY" -m venv "$SETUP/venv"
+      - name: Run the installer
+        run: |
+          cd "$RUNNER_TEMP/My Downloads/CSCS Job Hunter"
+          ./"Install CSCS Job Hunter.command" < /dev/null
+      - name: Show the install log
+        if: always()
+        run: cat "$HOME/Library/Application Support/CSCS Job Hunter Setup/install.log" | grep -v "^  " | tail -60 || true
+      - name: Self-test the installed app
+        run: |
+          APP="/Applications/CSCS Job Hunter.app"; [ -d "$APP" ] || APP="$HOME/Applications/CSCS Job Hunter.app"
+          osascript -e 'quit app "CSCS Job Hunter"' || true; sleep 3; pkill -x "CSCS Job Hunter" || true
+          file "$APP/Contents/MacOS/CSCS Job Hunter"
+          "$APP/Contents/MacOS/CSCS Job Hunter" --selftest
+          cat "$HOME/Library/Application Support/WMSJobAgent/selftest.txt"
+          grep -q "^server ok" "$HOME/Library/Application Support/WMSJobAgent/selftest.txt"
+          grep -q "tailor word ok" "$HOME/Library/Application Support/WMSJobAgent/selftest.txt"
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download and install the Windows zip
+        shell: pwsh
+        run: |
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" -p CSCS-Job-Hunter.zip -D $env:RUNNER_TEMP
+          Expand-Archive "$env:RUNNER_TEMP\CSCS-Job-Hunter.zip" "$env:RUNNER_TEMP\x"
+          $env:CSCS_NO_PAUSE = '1'; $env:CSCS_NO_LAUNCH = '1'; $env:CSCS_NO_CLAUDE = '1'
+          cmd /c "`"$env:RUNNER_TEMP\x\CSCS Job Hunter\Install CSCS Job Hunter.bat`""
+          if ($LASTEXITCODE -ne 0) { throw "installer exit $LASTEXITCODE" }
+      - name: Self-test the installed app
+        shell: pwsh
+        run: |
+          $exe = "$env:LOCALAPPDATA\Programs\CSCS Job Hunter\CSCS Job Hunter.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '--selftest' -Wait -PassThru
+          Get-Content "$env:LOCALAPPDATA\WMSJobAgent\selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "selftest exit $($p.ExitCode)" }
+          if (-not (Select-String -Quiet -Path "$env:LOCALAPPDATA\WMSJobAgent\selftest.txt" -Pattern 'tailor word ok')) { throw 'tailor check failed' }
